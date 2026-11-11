@@ -423,6 +423,13 @@ impl DeezerClient {
             crate::stream::Format::File { hint: "mp3", mime: Some("audio/mpeg".to_owned()) }
         };
 
+        // Probe real stream size
+        let size = probe_stream_size(http, &url).await;
+        if size == 0 {
+            log::warn!("Deezer: could not determine stream size for track {sng_id_str}");
+            return Ok(None);
+        }
+
         let info = crate::hires::Info {
             source: "Deezer".to_owned(),
             host: "deezer.com".to_owned(),
@@ -433,14 +440,8 @@ impl DeezerClient {
             bit_depth: if is_flac { Some(16) } else { None },
             channels: Some(2),
             atmos: false,
-            size: crate::hires::UNKNOWN_SIZE,
+            size,
             duration_ms: (duration_sec as u64) * 1000,
-        };
-
-        // Probe size
-        let size = match http.head(&url).header("User-Agent", USER_AGENT).send().await {
-            Ok(r) if r.status().is_success() => r.content_length().unwrap_or(crate::hires::UNKNOWN_SIZE),
-            _ => crate::hires::UNKNOWN_SIZE,
         };
 
         Ok(Some(DeezerStream {
@@ -453,6 +454,41 @@ impl DeezerClient {
             encrypted,
         }))
     }
+}
+
+/// Probe the true content length of a stream. Deezer CDNs reject HEAD or return Content-Length: 0,
+/// so we test HEAD first (only accepting > 0) and fallback to GET with Range: bytes=0-0 to parse
+/// the Content-Range header (e.g. "bytes 0-0/17868001").
+pub async fn probe_stream_size(http: &reqwest::Client, url: &str) -> u64 {
+    if let Ok(resp) = http.head(url).timeout(Duration::from_secs(4)).header("User-Agent", USER_AGENT).send().await {
+        if resp.status().is_success() {
+            if let Some(len) = resp.content_length().filter(|n| *n > 0) {
+                return len;
+            }
+        }
+    }
+
+    if let Ok(resp) = http.get(url)
+        .timeout(Duration::from_secs(4))
+        .header("User-Agent", USER_AGENT)
+        .header("Range", "bytes=0-0")
+        .header("Accept-Encoding", "identity")
+        .send()
+        .await
+    {
+        if let Some(range) = resp.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()) {
+            if let Some(total) = range.rsplit('/').next().and_then(|s| s.trim().parse::<u64>().ok()) {
+                if total > 0 {
+                    return total;
+                }
+            }
+        }
+        if let Some(len) = resp.content_length().filter(|n| *n > 0) {
+            return len;
+        }
+    }
+
+    0
 }
 
 fn extract_sid_from_cookie(s: &str) -> Option<String> {
@@ -590,5 +626,104 @@ mod tests {
         let free_res = parse_user_data_session(&free_json, "arl_free", Some("sid_cookie")).unwrap();
         assert_eq!(free_res.tier, DeezerTier::Free);
         assert_eq!(free_res.sid, "sid_cookie");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live network and valid Deezer ARL in DEEZER_ARL env var"]
+    async fn test_live_deezer_stream_probe() {
+        let http = reqwest::Client::new();
+        let Some(arl) = std::env::var("DEEZER_ARL").ok().filter(|s| !s.trim().is_empty()) else {
+            return;
+        };
+        let session = match validate_arl(&http, &arl).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("validate_arl failed (maybe offline or expired): {e}");
+                return;
+            }
+        };
+        println!("Session: tier={:?}, sid={}, lic_len={}", session.tier, session.sid, session.license_token.len());
+        let client = DeezerClient::new(session);
+        let track = Track {
+            id: "test".to_string(),
+            title: "Que Nadie Sepa Mi Sufrir".to_string(),
+            artists: vec![crate::model::Link { name: "Julio Jaramillo".to_string(), id: Some("a1".to_string()) }],
+            album: None,
+            duration: Some(153),
+            thumbs: vec![],
+            track_nr: None,
+            plays: None,
+            music_video: false,
+        };
+        let stream = client.find(&http, &track).await.unwrap();
+        println!("Stream: {:?}", stream);
+        if let Some(s) = stream {
+            println!("Stream URL: {}", s.url);
+            println!("Stream size: {}", s.size);
+            println!("Stream encrypted: {}", s.encrypted);
+            println!("Stream format: {:?}", s.format);
+
+            // Test fetching first 2048 bytes with Range
+            let resp = http.get(&s.url)
+                .header("User-Agent", USER_AGENT)
+                .header("Range", "bytes=0-2047")
+                .send()
+                .await
+                .unwrap();
+            println!("Range 0-2047 status: {}", resp.status());
+            println!("Range 0-2047 headers: {:?}", resp.headers());
+            let mut bytes = resp.bytes().await.unwrap().to_vec();
+            println!("First 16 raw bytes: {:02x?}", &bytes[..16.min(bytes.len())]);
+            if s.encrypted {
+                let key = derive_key(&s.id);
+                println!("Derived key: {:02x?}", key);
+                decrypt_stream_slice(&key, &mut bytes, 0);
+                println!("First 16 decrypted bytes: {:02x?}", &bytes[..16.min(bytes.len())]);
+                println!("Decrypted ASCII (if flac/id3): {:?}", String::from_utf8_lossy(&bytes[..16.min(bytes.len())]));
+            }
+
+            // Now test actual stream download and rodio decoding with the probed size
+            assert!(s.size > 0, "size must be probed successfully");
+            let shared = crate::stream::Shared::new(
+                s.size,
+                s.duration_ms,
+                None,
+                s.format.clone(),
+                Some(s.info.clone()),
+                false,
+            );
+            let http_clone = http.clone();
+            let url_clone = s.url.clone();
+            let key = derive_key(&s.id);
+            let shared_clone = shared.clone();
+            tokio::spawn(async move {
+                crate::stream::download(
+                    http_clone,
+                    url_clone,
+                    USER_AGENT.to_string(),
+                    shared_clone,
+                    None,
+                    crate::stream::Ranging::Deezer(key),
+                ).await;
+            });
+
+            // Try decoding
+            let dec_res = tokio::task::spawn_blocking(move || {
+                crate::stream::decoder(shared, false)
+            }).await.unwrap();
+
+            match dec_res {
+                Ok(mut decoder) => {
+                    use rodio::Source;
+                    println!("SUCCESS! Decoded format: rate={}, channels={}", decoder.sample_rate(), decoder.channels());
+                    let samples: Vec<_> = decoder.by_ref().take(100).collect();
+                    println!("First 100 samples read successfully! Total read: {}", samples.len());
+                    assert_eq!(samples.len(), 100);
+                }
+                Err(e) => {
+                    panic!("Decoder failed: {e:?}");
+                }
+            }
+        }
     }
 }

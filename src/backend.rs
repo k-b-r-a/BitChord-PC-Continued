@@ -1114,11 +1114,11 @@ impl Backend {
         };
         // If the song's audio won't start after all, the music video plays instead.
         let fallback = song.is_some().then(|| (self.clone(), listed.to_owned(), report));
-        if let Some(song) = song {
+        if let Some(ref song) = song {
             log::info!("play {listed} as its song {video_id}");
             // Carried over, the UI has it already.
             if !was_carried {
-                let _ = self.tx.send(Resp::PlayingAs { generation, listed: listed.to_owned(), song: Some(song) });
+                let _ = self.tx.send(Resp::PlayingAs { generation, listed: listed.to_owned(), song: Some(song.clone()) });
                 (self.wake)();
             }
         }
@@ -1133,12 +1133,18 @@ impl Backend {
         let audio = self.audio.clone();
         let tx = self.tx.clone();
         let wake = self.wake.clone();
+        let this = self.clone();
+        let this_video_id = video_id.to_owned();
+        let this_listed = listed.to_owned();
+        let this_song = song.clone();
+        let this_track = track.cloned();
+        let this_report = report && self.is_logged_in() && reports_plays();
         // Opening the decoder reads the container header, which blocks on the download.
         // Starting mid-song needs the seekable decoder (it waits for every fragment
         // header); from the top, the non-seekable one starts sooner.
         let seek = !at.is_zero();
         let shared2 = shared.clone();
-        let report = (report && self.is_logged_in() && reports_plays()).then(|| (self.clone(), video_id.to_owned()));
+        let report = this_report.then(|| (self.clone(), video_id.to_owned()));
         let open = move || -> anyhow::Result<crate::audio::TrackDecoder> {
             let mut d = stream::decoder(shared.clone(), seek)?;
             if seek {
@@ -1172,18 +1178,35 @@ impl Backend {
                     });
                 }
             }
-            Err(e) => match fallback {
-                Some((this, listed, report)) => {
-                    log::warn!("{listed}'s song won't start ({e}); playing the music video");
-                    let _ = tx.send(Resp::PlayingAs { generation, listed: listed.clone(), song: None });
-                    this.request(Req::Play { video_id: listed, generation, at, report, song_of: None, song: None, track: None });
+            Err(e) => {
+                if let Some(info) = shared2.info.as_ref() {
+                    log::warn!("{this_video_id}: {} audio failed to decode ({e}); reverting to YouTube audio", info.source);
+                    this.revert_quality(&this_video_id);
+                    this.request(Req::Play {
+                        video_id: this_listed,
+                        generation,
+                        at,
+                        report: this_report,
+                        song_of: None,
+                        song: this_song,
+                        track: this_track,
+                    });
                     wake();
+                } else {
+                    match fallback {
+                        Some((this, listed, report)) => {
+                            log::warn!("{listed}'s song won't start ({e}); playing the music video");
+                            let _ = tx.send(Resp::PlayingAs { generation, listed: listed.clone(), song: None });
+                            this.request(Req::Play { video_id: listed, generation, at, report, song_of: None, song: None, track: None });
+                            wake();
+                        }
+                        None => {
+                            let _ = tx.send(Resp::PlayError { generation, msg: format!("decode: {e}") });
+                            wake();
+                        }
+                    }
                 }
-                None => {
-                    let _ = tx.send(Resp::PlayError { generation, msg: format!("decode: {e}") });
-                    wake();
-                }
-            },
+            }
         });
         Ok(())
     }
