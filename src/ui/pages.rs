@@ -1294,6 +1294,22 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
         hires_sources_editor(app, ui);
         ui.add_space(10.0);
         divider(ui);
+        setting_row(ui, "Deezer Hi-Res source", Some("Stream FLAC Lossless (HiFi) or 320 kbps MP3 directly from Deezer with your ARL cookie token. Songs are matched against Deezer's catalog."), |ui| {
+            if toggle(ui, &mut app.deezer_enabled, "Deezer source").changed() {
+                if app.deezer_enabled {
+                    app.backend.set_deezer_session(app.deezer_session.clone());
+                } else {
+                    app.backend.set_deezer_session(None);
+                }
+            }
+        });
+        if app.deezer_enabled {
+            divider(ui);
+            ui.add_space(8.0);
+            deezer_source_editor(app, ui);
+            ui.add_space(8.0);
+        }
+        divider(ui);
         setting_row(ui, "Prefer Dolby Atmos", Some("Ask the hi-res sources for a Dolby Atmos copy when they offer one. Falls back to the best stereo copy when the stream's codec can't be decoded."), |ui| {
             if toggle(ui, &mut app.prefer_atmos, "Prefer Dolby Atmos").changed() {
                 app.backend.set_prefer_atmos(app.prefer_atmos);
@@ -1359,6 +1375,45 @@ fn hires_sources_editor(app: &mut App, ui: &mut Ui) {
 /// The non-empty links as one newline-separated list, the way the backend reads them.
 fn live_sources(app: &App) -> String {
     app.hires_sources.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
+}
+
+fn deezer_source_editor(app: &mut App, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        let field_w = (ui.available_width() - 110.0).max(120.0);
+        ui.allocate_ui_with_layout(vec2(field_w, 42.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(field_w);
+            super::text_field(ui, "", &mut app.deezer_arl, false, "Paste Deezer ARL cookie token");
+        });
+        let busy = app.deezer_validating;
+        let btn_text = if busy { "Checking..." } else { "Connect" };
+        if ui.add_enabled(!busy && !app.deezer_arl.trim().is_empty(), egui::Button::new(btn_text)).clicked() {
+            app.deezer_validating = true;
+            app.deezer_status = "Validating token...".to_owned();
+            app.backend.request(crate::backend::Req::ValidateDeezer(app.deezer_arl.trim().to_owned()));
+        }
+    });
+
+    if !app.deezer_status.is_empty() {
+        ui.add_space(4.0);
+        let color = if app.deezer_status.starts_with("Connected") {
+            Color32::from_rgb(0x34, 0xC7, 0x59)
+        } else if app.deezer_status.starts_with("Error") {
+            theme::RED
+        } else {
+            theme::text_dim()
+        };
+        ui.label(RichText::new(&app.deezer_status).font(theme::regular(13.0)).color(color));
+    }
+
+    if app.deezer_session.is_some() {
+        ui.add_space(4.0);
+        if pill(ui, "Disconnect Deezer", None, false).clicked() {
+            app.deezer_session = None;
+            app.deezer_arl.clear();
+            app.deezer_status.clear();
+            app.backend.set_deezer_session(None);
+        }
+    }
 }
 
 /// Settings › Downloads.

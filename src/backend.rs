@@ -97,6 +97,7 @@ pub enum Req {
     SaveCollection { id: String, save: bool },
     SetCookie(String),
     Logout,
+    ValidateDeezer(String),
 }
 
 impl Req {
@@ -143,6 +144,7 @@ impl Req {
             Req::SaveCollection { .. } => "Save to library",
             Req::SetCookie(_) => "Sign in",
             Req::Logout => "Sign out",
+            Req::ValidateDeezer(_) => "Validating Deezer ARL",
         }
     }
 
@@ -301,6 +303,7 @@ pub enum Resp {
     LoggedIn(bool),
     /// A past search left the account's history; the list already shows it gone.
     SearchForgotten,
+    DeezerSessionResult(Result<crate::deezer::DeezerSession, String>),
     Error(String),
 }
 
@@ -475,6 +478,8 @@ pub struct Backend {
     hires: Arc<std::sync::RwLock<Vec<Arc<hires::Client>>>>,
     /// Ask the addons for Dolby Atmos renditions when they offer one.
     atmos: Arc<std::sync::atomic::AtomicBool>,
+    /// Deezer client if logged in/configured.
+    pub deezer: Arc<std::sync::RwLock<Option<Arc<crate::deezer::DeezerClient>>>>,
     /// Songs the listener sent back to YouTube audio: no addon copy until they leave.
     reverted: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Song versions of music videos looked up this session (`None`: there's none), by
@@ -507,7 +512,7 @@ impl Backend {
         {
             log::warn!("proxy relay: {e:#}");
         }
-        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), hires: Default::default(), atmos: Default::default(), reverted: Default::default(), songs: Default::default() };
+        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), hires: Default::default(), deezer: Default::default(), atmos: Default::default(), reverted: Default::default(), songs: Default::default() };
         backend.keep_signed_in();
         Ok(backend)
     }
@@ -852,6 +857,19 @@ impl Backend {
                 Req::Logout => {
                     self.forget_session().await;
                     Resp::LoggedIn(false)
+                }
+                Req::ValidateDeezer(arl) => {
+                    let http = self.http();
+                    match crate::deezer::validate_arl(&http, &arl).await {
+                        Ok(session) => {
+                            self.set_deezer_session(Some(session.clone()));
+                            Resp::DeezerSessionResult(Ok(session))
+                        }
+                        Err(e) => {
+                            self.set_deezer_session(None);
+                            Resp::DeezerSessionResult(Err(e.to_string()))
+                        }
+                    }
                 }
             }))
         }
@@ -1384,6 +1402,22 @@ impl Backend {
                 Err(_) => log::info!("{video_id}: the hi-res sources gave no answer in {HIRES_WAIT:?}"),
             }
         }
+        if allow_hires && !reverted {
+            let deezer = self.deezer.read().unwrap().clone();
+            if let (Some(track), Some(deezer)) = (track, deezer) {
+                let started = std::time::Instant::now();
+                match tokio::time::timeout(HIRES_WAIT, self.from_deezer(&deezer, track)).await {
+                    Ok(Some(s)) => {
+                        if let Some(info) = s.info.as_ref() {
+                            log::info!("{video_id}: {} audio from Deezer ({})", info.badge(), info.codec);
+                        }
+                        return Ok((Source::Deezer, s));
+                    }
+                    Ok(None) => log::info!("{video_id}: no Deezer copy ({:.1}s)", started.elapsed().as_secs_f32()),
+                    Err(_) => log::info!("{video_id}: Deezer gave no answer in {HIRES_WAIT:?}"),
+                }
+            }
+        }
         let hq = best || self.hq.load(Ordering::Relaxed);
         if best
             && !self.jsc.ready()
@@ -1465,6 +1499,11 @@ impl Backend {
                 anyhow::ensure!(!sources.is_empty(), "no hi-res source is set");
                 self.from_hires(&sources, track).await.ok_or_else(|| anyhow::anyhow!("no hi-res source has a copy"))?
             }
+            Source::Deezer => {
+                let track = track.ok_or_else(|| anyhow::anyhow!("no song to look up"))?;
+                let deezer = self.deezer.read().unwrap().clone().ok_or_else(|| anyhow::anyhow!("Deezer not configured"))?;
+                self.from_deezer(&deezer, track).await.ok_or_else(|| anyhow::anyhow!("Deezer has no copy"))?
+            }
         })
     }
 
@@ -1502,6 +1541,38 @@ impl Backend {
             }
         }
         None
+    }
+
+    async fn from_deezer(&self, deezer: &Arc<crate::deezer::DeezerClient>, track: &Track) -> Option<ResolvedStream> {
+        match deezer.find(&self.http(), track).await {
+            Ok(Some(found)) => {
+                let key = crate::deezer::derive_key(&found.id);
+                let ranging = if found.encrypted {
+                    stream::Ranging::Deezer(key)
+                } else {
+                    stream::Ranging::Header
+                };
+                Some(ResolvedStream {
+                    url: found.url,
+                    size: found.size,
+                    duration_ms: found.duration_ms,
+                    user_agent: crate::deezer::USER_AGENT.to_owned(),
+                    loudness_db: None,
+                    format: found.format,
+                    info: Some(found.info),
+                    ranging,
+                    data: None,
+                })
+            }
+            Ok(None) => {
+                log::info!("Deezer: no copy of \"{}\"", track.title);
+                None
+            }
+            Err(e) => {
+                log::warn!("Deezer lookup error: {e:#}");
+                None
+            }
+        }
     }
 
     /// Get the signed-in playback path ready in the background, so the first Premium-only
@@ -1659,6 +1730,10 @@ impl Backend {
         Ok(resp)
     }
 
+    pub fn set_deezer_session(&self, session: Option<crate::deezer::DeezerSession>) {
+        *self.deezer.write().unwrap() = session.map(crate::deezer::DeezerClient::new);
+    }
+
     pub fn is_logged_in(&self) -> bool {
         self.api.account().is_some()
     }
@@ -1677,6 +1752,7 @@ enum Source {
     YtDlp,
     /// The listener's own addon server (see `hires`).
     HiRes,
+    Deezer,
 }
 
 struct ResolvedStream {

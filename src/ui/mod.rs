@@ -406,6 +406,16 @@ pub struct App {
     hires_focus: bool,
     /// Ask the addons for Dolby Atmos renditions.
     prefer_atmos: bool,
+    /// Deezer ARL token.
+    pub deezer_arl: String,
+    /// Whether Deezer source is enabled.
+    pub deezer_enabled: bool,
+    /// Current Deezer validation status text.
+    pub deezer_status: String,
+    /// Whether Deezer ARL is being validated right now.
+    pub deezer_validating: bool,
+    /// Active Deezer authenticated session if verified.
+    pub deezer_session: Option<crate::deezer::DeezerSession>,
     /// What the playing stream is (codec, rate, depth, size), when a hi-res source
     /// supplied it, with the generation it belongs to.
     audio_info: Option<(u64, crate::hires::Info)>,
@@ -587,6 +597,12 @@ impl App {
         backend.set_hires_source(&hires_sources.join("\n"));
         let prefer_atmos = get("prefer_atmos").is_some_and(|v| v == "1");
         backend.set_prefer_atmos(prefer_atmos);
+        let deezer_arl = get("deezer_arl").unwrap_or_default();
+        let deezer_enabled = get("deezer_enabled").is_some_and(|v| v == "1");
+        let deezer_session: Option<crate::deezer::DeezerSession> = get("deezer_session").and_then(|s| serde_json::from_str(&s).ok());
+        if deezer_enabled && !deezer_arl.is_empty() {
+            backend.set_deezer_session(deezer_session.clone());
+        }
         backend.request(Req::Home(None));
         if logged_in {
             backend.request(Req::Library);
@@ -721,6 +737,11 @@ impl App {
             hires_draft: String::new(),
             hires_focus: false,
             prefer_atmos,
+            deezer_status: deezer_session.as_ref().map(|s| format!("Connected: {} · {}", s.user_name, s.tier.label())).unwrap_or_default(),
+            deezer_validating: false,
+            deezer_arl,
+            deezer_enabled,
+            deezer_session,
             audio_info: None,
             show_nerd_stats: get("show_nerd_stats").is_some_and(|v| v == "1"),
             stream_stats: None,
@@ -1455,6 +1476,13 @@ impl eframe::App for App {
         storage.set_string("signature_api", self.signature_api.clone());
         storage.set_string("hires_source", self.hires_sources.join("\n"));
         storage.set_string("prefer_atmos", b(self.prefer_atmos));
+        storage.set_string("deezer_arl", self.deezer_arl.clone());
+        storage.set_string("deezer_enabled", b(self.deezer_enabled));
+        if let Some(ref s) = self.deezer_session {
+            storage.set_string("deezer_session", serde_json::to_string(s).unwrap_or_default());
+        } else {
+            storage.set_string("deezer_session", String::new());
+        }
         storage.set_string("show_nerd_stats", b(self.show_nerd_stats));
         storage.set_string("sponsorblock", b(self.sponsorblock));
         storage.set_string("crossfade", b(self.crossfade));

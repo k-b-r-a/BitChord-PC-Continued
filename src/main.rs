@@ -11,6 +11,7 @@ mod audio;
 mod backend;
 mod bidi;
 mod deeplink;
+mod deezer;
 mod discord;
 mod dash;
 mod downloads;

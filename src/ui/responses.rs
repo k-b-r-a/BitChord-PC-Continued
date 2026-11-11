@@ -496,6 +496,19 @@ impl App {
                 }
             }
             Resp::LoggedIn(v) => self.on_logged_in(v, now),
+            Resp::DeezerSessionResult(res) => {
+                self.deezer_validating = false;
+                match res {
+                    Ok(session) => {
+                        self.deezer_status = format!("Connected: {} · {}", session.user_name, session.tier.label());
+                        self.deezer_session = Some(session);
+                    }
+                    Err(e) => {
+                        self.deezer_status = format!("Error: {e}");
+                        self.deezer_session = None;
+                    }
+                }
+            }
             Resp::Error(e) => self.on_error(e),
         }
     }

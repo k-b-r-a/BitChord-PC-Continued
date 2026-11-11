@@ -66,6 +66,7 @@ impl Format {
 pub enum Ranging {
     Query,
     Header,
+    Deezer([u8; 16]),
 }
 
 struct Inner {
@@ -300,8 +301,14 @@ pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Ar
     // Addon servers may ignore ranges and answer 200 with the whole file: then one
     // sequential download fills the buffer, rather than every worker pulling the file.
     if ranging == Ranging::Header && !ranges_supported(&http, &url, &ua).await {
-        download_whole(&http, &url, &ua, &shared).await;
+        download_whole(&http, &url, &ua, &shared, None).await;
         return;
+    }
+    if let Ranging::Deezer(key) = ranging {
+        if !ranges_supported(&http, &url, &ua).await {
+            download_whole(&http, &url, &ua, &shared, Some(key)).await;
+            return;
+        }
     }
     let slot = Arc::new(UrlSlot { url: tokio::sync::Mutex::new((url, 0)), refresh });
     let mut set = tokio::task::JoinSet::new();
@@ -334,6 +341,14 @@ pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Ar
                         match ranging {
                             Ranging::Query => fetch(&client, &format!("{url}&range={a}-{b}"), &ua, b - a + 1).await,
                             Ranging::Header => fetch_range(&client, &url, &ua, a, b, shared.total).await,
+                            Ranging::Deezer(key) => match fetch_range(&client, &url, &ua, a, b, shared.total).await {
+                                Ok(data) => {
+                                    let mut buf = data.to_vec();
+                                    crate::deezer::decrypt_stream_slice(&key, &mut buf, a);
+                                    Ok(bytes::Bytes::from(buf))
+                                }
+                                Err(e) => Err(e),
+                            },
                         }
                     };
                     match res {
@@ -433,7 +448,7 @@ async fn ranges_supported(http: &reqwest::Client, url: &str, ua: &str) -> bool {
 
 /// One sequential download for a server that won't serve ranges, filling `shared` block
 /// by block as bytes arrive so playback can start before the file is complete.
-async fn download_whole(http: &reqwest::Client, url: &str, ua: &str, shared: &Arc<Shared>) {
+async fn download_whole(http: &reqwest::Client, url: &str, ua: &str, shared: &Arc<Shared>, decrypt_key: Option<[u8; 16]>) {
     let stalled = || anyhow::anyhow!("no data for {} s", STALL.as_secs());
     let result = async {
         let mut resp = tokio::time::timeout(
@@ -452,7 +467,11 @@ async fn download_whole(http: &reqwest::Client, url: &str, ua: &str, shared: &Ar
             received += chunk.len() as u64;
             buf.extend_from_slice(&chunk);
             while buf.len() >= block && idx < blocks {
-                shared.put(idx, buf.split_to(block).freeze());
+                let mut b = buf.split_to(block).to_vec();
+                if let Some(key) = decrypt_key {
+                    crate::deezer::decrypt_stream_slice(&key, &mut b, idx as u64 * BLOCK);
+                }
+                shared.put(idx, bytes::Bytes::from(b));
                 idx += 1;
             }
             if shared.inner.lock().unwrap().cancelled {
@@ -461,7 +480,11 @@ async fn download_whole(http: &reqwest::Client, url: &str, ua: &str, shared: &Ar
         }
         anyhow::ensure!(received == shared.total, "short read: {received} of {} bytes", shared.total);
         if idx < blocks {
-            shared.put(idx, buf.split().freeze());
+            let mut b = buf.split().to_vec();
+            if let Some(key) = decrypt_key {
+                crate::deezer::decrypt_stream_slice(&key, &mut b, idx as u64 * BLOCK);
+            }
+            shared.put(idx, bytes::Bytes::from(b));
         }
         anyhow::Ok(())
     }
